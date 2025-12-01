@@ -935,6 +935,72 @@ public:
   }
 };
 
+class SpecializeContractionGenericsToMatmul : public OpRewritePattern<linalg::GenericOp> {
+public:
+  using Base::Base;
+
+  LogicalResult matchAndRewrite(linalg::GenericOp genericOp, PatternRewriter &rewriter) const override {
+    if (!IREE::Flow::isNonNullAndOutsideDispatch(genericOp)) {
+      return failure();
+    }
+    
+    auto maybeContractionDims = linalg::inferContractionDims(genericOp);
+    if (failed(maybeContractionDims)) {
+      return rewriter.notifyMatchFailure(genericOp, "not a contraction");
+    }
+    auto contractionDims = *maybeContractionDims;
+
+    if (contractionDims.m.size() != 1 || contractionDims.n.size() != 1 ||
+        contractionDims.k.size() != 1 || contractionDims.batch.size() != 0) {
+      return rewriter.notifyMatchFailure(genericOp, "only 2D matmul");
+    }
+
+    auto indexingMaps = genericOp.getIndexingMapsArray();
+    unsigned m = contractionDims.m[0];
+    unsigned n = contractionDims.n[0];
+    unsigned k = contractionDims.k[0];
+
+    // Helper
+    auto checkMap = [](AffineMap map, unsigned expectedDim0, unsigned expectedDim1) -> bool {
+      if (map.getNumResults() != 2) return false;
+      auto expr0 = dyn_cast<AffineDimExpr>(map.getResult(0));
+      auto expr1 = dyn_cast<AffineDimExpr>(map.getResult(1));
+      if (!expr0 || !expr1) return false;
+      return expr0.getPosition() == expectedDim0 && expr1.getPosition() == expectedDim1;
+    };
+
+    if (!checkMap(indexingMaps[2], m, n)) {
+      return rewriter.notifyMatchFailure(genericOp, "output map is not (m, n)");
+    }
+
+    bool lhsIsStandard = checkMap(indexingMaps[0], m, k);  // (m, k)
+    bool lhsIsTransposed = checkMap(indexingMaps[0], k, m); // (k, m)
+    bool rhsIsStandard = checkMap(indexingMaps[1], k, n);  // (k, n)
+    bool rhsIsTransposed = checkMap(indexingMaps[1], n, k); // (n, k)
+
+    if (!((lhsIsStandard || lhsIsTransposed) && (rhsIsStandard || rhsIsTransposed))) {
+      return rewriter.notifyMatchFailure(genericOp, "indexing maps don't match any matmul variant");
+    }
+
+    SmallVector<NamedAttribute> attrs = linalg::getPrunedAttributeList(genericOp);
+
+    if (lhsIsStandard && rhsIsStandard) {
+      // Standard matmul: (m,k) x (k,n) -> (m,n)
+      rewriter.replaceOpWithNewOp<linalg::MatmulOp>(genericOp, genericOp.getDpsInputs(), genericOp.getDpsInits(), attrs);
+    } else if (lhsIsTransposed && rhsIsStandard) {
+      // Transpose A: (k,m) x (k,n) -> (m,n)
+      rewriter.replaceOpWithNewOp<linalg::MatmulTransposeAOp>(genericOp, genericOp.getDpsInputs(), genericOp.getDpsInits(), attrs);
+    } else if (lhsIsStandard && rhsIsTransposed) {
+      // Transpose B: (m,k) x (n,k) -> (m,n)
+      rewriter.replaceOpWithNewOp<linalg::MatmulTransposeBOp>(genericOp, genericOp.getDpsInputs(), genericOp.getDpsInits(), attrs);
+    } else {      
+      return rewriter.notifyMatchFailure(genericOp, "both operands transposed - no named op for this");
+    }
+
+    return success();
+  }
+};
+
 } // namespace
 
 //===----------------------------------------------------------------------===//
@@ -1095,6 +1161,8 @@ void PropagateLinalgTransposePass::runOnOperation() {
     populateCommonCanonicalizationPatterns(context, sinkingPatterns);
     sinkingPatterns.add<SinkTransposeThroughUnaryElementwiseInput>(
         context, /*benefit=*/2);
+    // Add pattern to specialize generic contractions to named matmul ops
+    sinkingPatterns.insert<SpecializeContractionGenericsToMatmul>(context);
     if (failed(applyPatternsGreedily(funcOp, std::move(sinkingPatterns)))) {
       funcOp.emitError("Transpose initial sinking patterns failed");
       return signalPassFailure();
